@@ -20,8 +20,11 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -38,6 +41,135 @@ struct apps_std_ctx {
 	int adsp_library_dirfd;
 	struct hexagonfs_fd *fds[HEXAGONFS_MAX_FD];
 };
+
+
+/*
+ * Optional write support for the sensors registry.
+ *
+ * The sensors PD rebuilds its registry under the persist partition and
+ * fails to start if it can't. When HEXAGONRPCD_SNS_WRITE_DIR is set, paths
+ * below the persist registry directory are backed by that (writable) host
+ * directory instead of the read-only served tree.
+ */
+#define WRITE_FD_BASE 0x4000
+#define WRITE_FD_MAX 16
+
+static int write_fds[WRITE_FD_MAX] = {
+	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+};
+
+static const char *const sns_reg_prefixes[] = {
+	"/mnt/vendor/persist/sensors/registry/",
+	"/persist/sensors/registry/",
+};
+
+/* Map a DSP path into the write directory, or return -1 if not applicable. */
+static int map_write_path(const char *path, char *out, size_t n)
+{
+	const char *dir = getenv("HEXAGONRPCD_SNS_WRITE_DIR");
+	char comps[32][128];
+	const char *rest = NULL, *p;
+	size_t i, depth = 0, len;
+
+	if (dir == NULL)
+		return -1;
+
+	for (i = 0; i < sizeof(sns_reg_prefixes) / sizeof(*sns_reg_prefixes); i++) {
+		len = strlen(sns_reg_prefixes[i]);
+		if (!strncmp(path, sns_reg_prefixes[i], len)) {
+			rest = path + len;
+			break;
+		}
+	}
+	if (rest == NULL)
+		return -1;
+
+	/* Normalise "a/../b" style paths without escaping the directory. */
+	for (p = rest; *p;) {
+		const char *end = strchr(p, '/');
+
+		len = end ? (size_t) (end - p) : strlen(p);
+		if (len == 0 || (len == 1 && p[0] == '.')) {
+			/* skip */
+		} else if (len == 2 && p[0] == '.' && p[1] == '.') {
+			if (depth == 0)
+				return -1;
+			depth--;
+		} else {
+			if (depth >= 32 || len >= 128)
+				return -1;
+			memcpy(comps[depth], p, len);
+			comps[depth][len] = 0;
+			depth++;
+		}
+		p += len;
+		if (*p == '/')
+			p++;
+	}
+
+	len = snprintf(out, n, "%s", dir);
+	for (i = 0; i < depth && len < n; i++)
+		len += snprintf(out + len, n - len, "/%s", comps[i]);
+
+	return len < n ? 0 : -1;
+}
+
+static bool is_write_fd(uint32_t fd)
+{
+	return fd >= WRITE_FD_BASE && fd < WRITE_FD_BASE + WRITE_FD_MAX
+	    && write_fds[fd - WRITE_FD_BASE] >= 0;
+}
+
+static uint32_t apps_std_fwrite(void *data,
+				const struct fastrpc_io_buffer *inbufs,
+				struct fastrpc_io_buffer *outbufs)
+{
+	const uint32_t *fd = inbufs[0].p;
+	struct {
+		uint32_t written;
+		uint32_t is_eof;
+	} *first_out = outbufs[0].p;
+	ssize_t ret;
+
+	if (!is_write_fd(*fd))
+		return AEE_EBADPARM;
+
+	ret = write(write_fds[*fd - WRITE_FD_BASE], inbufs[1].p, inbufs[1].s);
+	if (ret < 0)
+		return AEE_EFAILED;
+
+	first_out->written = ret;
+	first_out->is_eof = 0;
+
+	return 0;
+}
+
+static uint32_t apps_std_frename(void *data,
+				 const struct fastrpc_io_buffer *inbufs,
+				 struct fastrpc_io_buffer *outbufs)
+{
+	char from[512], to[512];
+
+	fprintf(stderr, "rename-like call: num %u, \"%.*s\" -> \"%.*s\"\n",
+		((const uint32_t *) inbufs[0].p)[0],
+		(int) inbufs[1].s, (const char *) inbufs[1].p,
+		(int) inbufs[2].s, (const char *) inbufs[2].p);
+
+	if (inbufs[1].s == 0 || ((const char *) inbufs[1].p)[inbufs[1].s - 1] != 0
+	 || inbufs[2].s == 0 || ((const char *) inbufs[2].p)[inbufs[2].s - 1] != 0)
+		return AEE_EBADPARM;
+
+	if (map_write_path(inbufs[1].p, from, sizeof(from))
+	 || map_write_path(inbufs[2].p, to, sizeof(to))) {
+		fprintf(stderr, "Tried to rename %s\n", (const char *) inbufs[1].p);
+		return AEE_EUNSUPPORTED;
+	}
+
+	if (rename(from, to))
+		return AEE_EFAILED;
+
+	return 0;
+}
 
 static const int apps_std_whence_table[] = {
 	SEEK_SET,
@@ -72,6 +204,12 @@ static uint32_t apps_std_fclose(void *data,
 	struct apps_std_ctx *ctx = data;
 	const uint32_t *first_in = inbufs[0].p;
 	int ret;
+
+	if (is_write_fd(*first_in)) {
+		close(write_fds[*first_in - WRITE_FD_BASE]);
+		write_fds[*first_in - WRITE_FD_BASE] = -1;
+		return 0;
+	}
 
 	ret = hexagonfs_close(ctx->fds, *first_in);
 	if (ret) {
@@ -167,6 +305,27 @@ static uint32_t apps_std_fopen_with_env(void *data,
 
 	rw_mode = ((const char *) inbufs[4].p)[0];
 	if (rw_mode == 'w' || rw_mode == 'a') {
+		char real[512];
+		int i;
+
+		if (!map_write_path(inbufs[3].p, real, sizeof(real))) {
+			for (i = 0; i < WRITE_FD_MAX && write_fds[i] >= 0; i++);
+			if (i == WRITE_FD_MAX)
+				return AEE_ENOMEMORY;
+
+			write_fds[i] = open(real, O_WRONLY | O_CREAT | O_CLOEXEC
+					    | (rw_mode == 'a' ? O_APPEND : O_TRUNC),
+					    0660);
+			if (write_fds[i] < 0) {
+				fprintf(stderr, "Could not create %s: %s\n",
+						real, strerror(errno));
+				return AEE_EFAILED;
+			}
+
+			*out = WRITE_FD_BASE + i;
+			return 0;
+		}
+
 		fprintf(stderr, "Tried to open %s for writing\n",
 				(const char *) inbufs[3].p);
 		return AEE_EUNSUPPORTED;
@@ -204,6 +363,33 @@ static uint32_t apps_std_fopen_with_env(void *data,
 #endif
 
 	*out = fd;
+
+	return 0;
+}
+
+/*
+ * The served tree is read-only. The sensors PD removes stale registry
+ * files before rewriting them; report success so it carries on with the
+ * files that are already there.
+ */
+static uint32_t apps_std_fremove(void *data,
+				 const struct fastrpc_io_buffer *inbufs,
+				 struct fastrpc_io_buffer *outbufs)
+{
+	if (inbufs[1].s == 0 || ((const char *) inbufs[1].p)[inbufs[1].s - 1] != 0)
+		return AEE_EBADPARM;
+
+	{
+		char real[512];
+
+		if (!map_write_path(inbufs[1].p, real, sizeof(real))) {
+			if (unlink(real) && errno != ENOENT)
+				return AEE_EFAILED;
+			return 0;
+		}
+	}
+
+	fprintf(stderr, "Ignoring removal of %s\n", (const char *) inbufs[1].p);
 
 	return 0;
 }
@@ -420,7 +606,10 @@ static const struct fastrpc_function_impl apps_std_procs[] = {
 		.def = &apps_std_fread_def,
 		.impl = apps_std_fread,
 	},
-	{ .def = NULL, .impl = NULL, },
+	{
+		.def = &apps_std_fwrite_def,
+		.impl = apps_std_fwrite,
+	},
 	{ .def = NULL, .impl = NULL, },
 	{ .def = NULL, .impl = NULL, },
 	{ .def = NULL, .impl = NULL, },
@@ -445,7 +634,10 @@ static const struct fastrpc_function_impl apps_std_procs[] = {
 	{ .def = NULL, .impl = NULL, },
 	{ .def = NULL, .impl = NULL, },
 	{ .def = NULL, .impl = NULL, },
-	{ .def = NULL, .impl = NULL, },
+	{
+		.def = &apps_std_fremove_def,
+		.impl = apps_std_fremove,
+	},
 	{ .def = NULL, .impl = NULL, },
 	{
 		.def = &apps_std_opendir_def,
@@ -465,10 +657,15 @@ static const struct fastrpc_function_impl apps_std_procs[] = {
 		.def = &apps_std_stat_def,
 		.impl = apps_std_stat,
 	},
+	{ .def = NULL, .impl = NULL, },
+	{
+		.def = &apps_std_frename_def,
+		.impl = apps_std_frename,
+	},
 };
 
 const struct fastrpc_interface apps_std_interface = {
 	.name = "apps_std",
-	.n_procs = 32,
+	.n_procs = sizeof(apps_std_procs) / sizeof(*apps_std_procs),
 	.procs = apps_std_procs,
 };

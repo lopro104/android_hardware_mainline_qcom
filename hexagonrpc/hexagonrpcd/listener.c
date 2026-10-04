@@ -20,6 +20,8 @@
  */
 
 #include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
 #include <libhexagonrpc/fastrpc.h>
 #include <libhexagonrpc/interfaces/remotectl.def>
 #include <stddef.h>
@@ -54,6 +56,15 @@ static int adsp_listener_next2(int fd,
 			sc,
 			inbufs_len,
 			inbufs_size, inbufs);
+}
+
+static int adsp_listener_get_in_bufs2(int fd, uint32_t rctx, uint32_t offset,
+				      uint32_t *len, uint32_t size, void *buf)
+{
+	return fastrpc2(&adsp_listener_get_in_bufs2_def, fd, ADSP_LISTENER_HANDLE,
+			rctx, offset,
+			len,
+			size, buf);
 }
 
 static struct fastrpc_io_buffer *allocate_outbufs(const struct fastrpc_function_def_interp2 *def,
@@ -142,7 +153,8 @@ static int return_for_next_invoke(int fd,
 				  struct fastrpc_io_buffer **decoded)
 {
 	struct fastrpc_decoder_context *ctx;
-	char inbufs[256];
+	char inbufs_small[256];
+	char *inbufs = inbufs_small, *inbufs_large = NULL;
 	char *outbufs = NULL;
 	uint32_t inbufs_len;
 	uint32_t outbufs_len;
@@ -164,7 +176,7 @@ static int return_for_next_invoke(int fd,
 				  *rctx, result,
 				  outbufs_len, outbufs,
 				  rctx, handle, sc,
-				  &inbufs_len, 256, inbufs);
+				  &inbufs_len, 256, inbufs_small);
 	if (ret) {
 		if (ret == -1)
 			perror("Could not fetch next FastRPC message");
@@ -175,9 +187,29 @@ static int return_for_next_invoke(int fd,
 	}
 
 	if (inbufs_len > 256) {
-		fprintf(stderr, "Large (>256B) input buffers aren't implemented\n");
-		ret = -1;
-		goto err_free_outbufs;
+		uint32_t got = 256, chunk;
+
+		/* Fetch the remainder that didn't fit in the first message. */
+		inbufs_large = malloc(inbufs_len);
+		if (inbufs_large == NULL) {
+			ret = -1;
+			goto err_free_outbufs;
+		}
+
+		memcpy(inbufs_large, inbufs_small, 256);
+		while (got < inbufs_len) {
+			ret = adsp_listener_get_in_bufs2(fd, *rctx, got, &chunk,
+							 inbufs_len - got,
+							 inbufs_large + got);
+			if (ret || chunk == 0) {
+				fprintf(stderr, "Could not fetch large input buffer\n");
+				ret = -1;
+				goto err_free_outbufs;
+			}
+			got += chunk;
+		}
+
+		inbufs = inbufs_large;
 	}
 
 	ctx = inbuf_decode_start(*sc);
@@ -202,6 +234,7 @@ static int return_for_next_invoke(int fd,
 	*decoded = inbuf_decode_finish(ctx);
 
 err_free_outbufs:
+	free(inbufs_large);
 	free(outbufs);
 	return ret;
 }
@@ -219,6 +252,14 @@ static int invoke_requested_procedure(size_t n_ifaces,
 	uint8_t out_count;
 	uint32_t method = REMOTE_SCALARS_METHOD(sc);
 	int ret;
+
+	/*
+	 * Some DSP builds use method 31 of apps_std (handle 1) for renaming
+	 * (two names in, nothing out) rather than stat. Route it to frename.
+	 */
+	if (handle == 1 && method == 31
+	 && REMOTE_SCALARS_INBUFS(sc) == 3 && REMOTE_SCALARS_OUTBUFS(sc) == 0)
+		method = 33;
 
 	if (sc & 0xff) {
 		fprintf(stderr, "Handles are not supported, but got %u in, %u out\n",
