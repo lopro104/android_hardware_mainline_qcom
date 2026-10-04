@@ -2,3 +2,5 @@ service vendor.hexagonrpcd-adsp-sensorspd /vendor/bin/hexagonrpcd -f /dev/fastrp
     class core
     user system
     group system
+    # The sensors PD rebuilds its registry; keep it writable under /data
+    setenv HEXAGONRPCD_SNS_WRITE_DIR /data/vendor/sensors

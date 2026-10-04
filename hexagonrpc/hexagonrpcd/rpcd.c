@@ -408,6 +408,8 @@ free_compatible:
 
 int main(int argc, char* argv[])
 {
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	char *fastrpc_node = NULL;
 	const char *device_dir = "/usr/share/qcom/";
 	const char *dsp = "";

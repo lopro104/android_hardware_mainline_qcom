@@ -261,6 +261,10 @@ static int invoke_requested_procedure(size_t n_ifaces,
 	 && REMOTE_SCALARS_INBUFS(sc) == 3 && REMOTE_SCALARS_OUTBUFS(sc) == 0)
 		method = 33;
 
+#ifdef HEXAGONRPC_VERBOSE
+	printf("call handle %u method %u sc %08x\n", handle, method, sc);
+#endif
+
 	if (sc & 0xff) {
 		fprintf(stderr, "Handles are not supported, but got %u in, %u out\n",
 				(sc & 0xf0) >> 4, sc & 0xf);
